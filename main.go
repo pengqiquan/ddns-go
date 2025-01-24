@@ -1,60 +1,126 @@
 package main
 
 import (
-	"ddns-go/config"
-	"ddns-go/dns"
-	"ddns-go/util"
-	"ddns-go/web"
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
+	"github.com/jeessy2/ddns-go/v6/config"
+	"github.com/jeessy2/ddns-go/v6/dns"
+	"github.com/jeessy2/ddns-go/v6/util"
+	"github.com/jeessy2/ddns-go/v6/util/update"
+	"github.com/jeessy2/ddns-go/v6/web"
 	"github.com/kardianos/service"
 )
 
+// ddns-go 版本
+// ddns-go version
+var versionFlag = flag.Bool("v", false, "ddns-go version")
+
+// 更新 ddns-go
+var updateFlag = flag.Bool("u", false, "Upgrade ddns-go to the latest version")
+
 // 监听地址
-var listen = flag.String("l", ":9876", "监听地址")
+var listen = flag.String("l", ":9876", "Listen address")
 
 // 更新频率(秒)
-var every = flag.Int("f", 300, "同步间隔时间(秒)")
+var every = flag.Int("f", 300, "Update frequency(seconds)")
+
+// 缓存次数
+var ipCacheTimes = flag.Int("cacheTimes", 5, "Cache times")
 
 // 服务管理
-var serviceType = flag.String("s", "", "服务管理, 支持install, uninstall")
+var serviceType = flag.String("s", "", "Service management (install|uninstall|restart)")
 
 // 配置文件路径
-var configFilePath = flag.String("c", util.GetConfigFilePathDefault(), "自定义配置文件路径")
+var configFilePath = flag.String("c", util.GetConfigFilePathDefault(), "Custom configuration file path")
+
+// Web 服务
+var noWebService = flag.Bool("noweb", false, "No web service")
+
+// 跳过验证证书
+var skipVerify = flag.Bool("skipVerify", false, "Skip certificate verification")
+
+// 自定义 DNS 服务器
+var customDNS = flag.String("dns", "", "Custom DNS server address, example: 8.8.8.8")
+
+// 重置密码
+var newPassword = flag.String("resetPassword", "", "Reset password to the one entered")
 
 //go:embed static
-var staticEmbededFiles embed.FS
+var staticEmbeddedFiles embed.FS
 
 //go:embed favicon.ico
-var faviconEmbededFile embed.FS
+var faviconEmbeddedFile embed.FS
+
+// version
+var version = "DEV"
 
 func main() {
 	flag.Parse()
-	if _, err := net.ResolveTCPAddr("tcp", *listen); err != nil {
-		log.Fatalf("解析监听地址异常，%s", err)
+	if *versionFlag {
+		fmt.Println(version)
+		return
+	}
+	if *updateFlag {
+		update.Self(version)
+		return
 	}
 
+	// 安卓 go/src/time/zoneinfo_android.go 固定localLoc 为 UTC
+	if runtime.GOOS == "android" {
+		util.FixTimezone()
+	}
+	// 检查监听地址
+	if _, err := net.ResolveTCPAddr("tcp", *listen); err != nil {
+		log.Fatalf("Parse listen address failed! Exception: %s", err)
+	}
+	// 设置版本号
+	os.Setenv(web.VersionEnv, version)
+	// 设置配置文件路径
 	if *configFilePath != "" {
 		absPath, _ := filepath.Abs(*configFilePath)
 		os.Setenv(util.ConfigFilePathENV, absPath)
 	}
+	// 重置密码
+	if *newPassword != "" {
+		conf, err := config.GetConfigCached()
+		if err == nil {
+			conf.ResetPassword(*newPassword)
+		} else {
+			util.Log("配置文件 %s 不存在, 可通过-c指定配置文件", *configFilePath)
+		}
+		return
+	}
+	// 设置跳过证书验证
+	if *skipVerify {
+		util.SetInsecureSkipVerify()
+	}
+	// 设置自定义DNS
+	if *customDNS != "" {
+		util.SetDNS(*customDNS)
+	}
+	os.Setenv(util.IPCacheTimesENV, strconv.Itoa(*ipCacheTimes))
 	switch *serviceType {
 	case "install":
 		installService()
 	case "uninstall":
 		uninstallService()
+	case "restart":
+		restartService()
 	default:
 		if util.IsRunInDocker() {
-			run(5 * time.Second)
+			run()
 		} else {
 			s := getService()
 			status, _ := s.Status()
@@ -65,43 +131,78 @@ func main() {
 				// 非服务方式运行
 				switch s.Platform() {
 				case "windows-service":
-					log.Println("可使用 .\\ddns-go.exe -s install 安装服务运行")
+					util.Log("可使用 .\\ddns-go.exe -s install 安装服务运行")
 				default:
-					log.Println("可使用 ./ddns-go -s install 安装服务运行")
+					util.Log("可使用 sudo ./ddns-go -s install 安装服务运行")
 				}
-				run(1 * time.Second)
+				run()
 			}
 		}
 	}
 }
 
-func run(firstDelay time.Duration) {
+func run() {
+	// 兼容之前的配置文件
+	conf, _ := config.GetConfigCached()
+	conf.CompatibleConfig()
+	// 初始化语言
+	util.InitLogLang(conf.Lang)
+
+	if !*noWebService {
+		go func() {
+			// 启动web服务
+			err := runWebServer()
+			if err != nil {
+				log.Println(err)
+				time.Sleep(time.Minute)
+				os.Exit(1)
+			}
+		}()
+	}
+
+	// 初始化备用DNS
+	util.InitBackupDNS(*customDNS, conf.Lang)
+
+	// 等待网络连接
+	util.WaitInternet(dns.Addresses)
+
+	// 定时运行
+	dns.RunTimer(time.Duration(*every) * time.Second)
+}
+
+func staticFsFunc(writer http.ResponseWriter, request *http.Request) {
+	http.FileServer(http.FS(staticEmbeddedFiles)).ServeHTTP(writer, request)
+}
+
+func faviconFsFunc(writer http.ResponseWriter, request *http.Request) {
+	http.FileServer(http.FS(faviconEmbeddedFile)).ServeHTTP(writer, request)
+}
+
+func runWebServer() error {
 	// 启动静态文件服务
-	http.Handle("/static/", http.FileServer(http.FS(staticEmbededFiles)))
-	http.Handle("/favicon.ico", http.FileServer(http.FS(faviconEmbededFile)))
+	http.HandleFunc("/static/", web.AuthAssert(staticFsFunc))
+	http.HandleFunc("/favicon.ico", web.AuthAssert(faviconFsFunc))
+	http.HandleFunc("/login", web.AuthAssert(web.Login))
+	http.HandleFunc("/loginFunc", web.AuthAssert(web.LoginFunc))
 
-	http.HandleFunc("/", web.BasicAuth(web.Writing))
-	http.HandleFunc("/save", web.BasicAuth(web.Save))
-	http.HandleFunc("/logs", web.BasicAuth(web.Logs))
-	http.HandleFunc("/clearLog", web.BasicAuth(web.ClearLog))
-	http.HandleFunc("/ipv4NetInterface", web.BasicAuth(web.Ipv4NetInterfaces))
-	http.HandleFunc("/ipv6NetInterface", web.BasicAuth(web.Ipv6NetInterfaces))
-	http.HandleFunc("/webhookTest", web.BasicAuth(web.WebhookTest))
+	http.HandleFunc("/", web.Auth(web.Writing))
+	http.HandleFunc("/save", web.Auth(web.Save))
+	http.HandleFunc("/logs", web.Auth(web.Logs))
+	http.HandleFunc("/clearLog", web.Auth(web.ClearLog))
+	http.HandleFunc("/webhookTest", web.Auth(web.WebhookTest))
+	http.HandleFunc("/logout", web.Auth(web.Logout))
 
-	log.Println("监听", *listen, "...")
+	util.Log("监听 %s", *listen)
+
+	l, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return errors.New(util.LogStr("监听端口发生异常, 请检查端口是否被占用! %s", err))
+	}
 
 	// 没有配置, 自动打开浏览器
 	autoOpenExplorer()
 
-	// 定时运行
-	go dns.RunTimer(firstDelay, time.Duration(*every)*time.Second)
-	err := http.ListenAndServe(*listen, nil)
-
-	if err != nil {
-		log.Println("启动端口发生异常, 请检查端口是否被占用", err)
-		time.Sleep(time.Minute)
-		os.Exit(1)
-	}
+	return http.Serve(l, nil)
 }
 
 type program struct{}
@@ -112,8 +213,7 @@ func (p *program) Start(s service.Service) error {
 	return nil
 }
 func (p *program) run() {
-	// 服务运行，延时10秒运行，等待网络
-	run(10 * time.Second)
+	run()
 }
 func (p *program) Stop(s service.Service) error {
 	// Stop should not block. Return with a few seconds.
@@ -122,22 +222,40 @@ func (p *program) Stop(s service.Service) error {
 
 func getService() service.Service {
 	options := make(service.KeyValue)
-	if service.ChosenSystem().String() == "unix-systemv" {
-		options["SysvScript"] = sysvScript
-	}
+	var depends []string
 
-	// mac/win 使用用户服务
-	if service.ChosenSystem().String() == "darwin-launchd" ||
-		service.ChosenSystem().String() == "windows-service" {
-		options["UserService"] = true
+	// 确保服务等待网络就绪后再启动
+	switch service.ChosenSystem().String() {
+	case "unix-systemv":
+		options["SysvScript"] = sysvScript
+	case "windows-service":
+		// 将 Windows 服务的启动类型设为自动(延迟启动)
+		options["DelayedAutoStart"] = true
+	default:
+		// 向 Systemd 添加网络依赖
+		depends = append(depends, "Requires=network.target",
+			"After=network-online.target")
 	}
 
 	svcConfig := &service.Config{
-		Name:        "ddns-go",
-		DisplayName: "ddns-go",
-		Description: "简单好用的DDNS。自动更新域名解析到公网IP(支持阿里云、腾讯云dnspod、Cloudflare、华为云)",
-		Arguments:   []string{"-l", *listen, "-f", strconv.Itoa(*every), "-c", *configFilePath},
-		Option:      options,
+		Name:         "ddns-go",
+		DisplayName:  "ddns-go",
+		Description:  "Simple and easy to use DDNS. Automatically update domain name resolution to public IP (Support Aliyun, Tencent Cloud, Dnspod, Cloudflare, Callback, Huawei Cloud, Baidu Cloud, Porkbun, GoDaddy...)",
+		Arguments:    []string{"-l", *listen, "-f", strconv.Itoa(*every), "-cacheTimes", strconv.Itoa(*ipCacheTimes), "-c", *configFilePath},
+		Dependencies: depends,
+		Option:       options,
+	}
+
+	if *noWebService {
+		svcConfig.Arguments = append(svcConfig.Arguments, "-noweb")
+	}
+
+	if *skipVerify {
+		svcConfig.Arguments = append(svcConfig.Arguments, "-skipVerify")
+	}
+
+	if *customDNS != "" {
+		svcConfig.Arguments = append(svcConfig.Arguments, "-dns", *customDNS)
 	}
 
 	prg := &program{}
@@ -152,10 +270,15 @@ func getService() service.Service {
 func uninstallService() {
 	s := getService()
 	s.Stop()
+	if service.ChosenSystem().String() == "unix-systemv" {
+		if _, err := exec.Command("/etc/init.d/ddns-go", "stop").Output(); err != nil {
+			log.Println(err)
+		}
+	}
 	if err := s.Uninstall(); err == nil {
-		log.Println("ddns-go 服务卸载成功!")
+		util.Log("ddns-go 服务卸载成功")
 	} else {
-		log.Printf("ddns-go 服务卸载失败, ERR: %s\n", err)
+		util.Log("ddns-go 服务卸载失败, 异常信息: %s", err)
 	}
 }
 
@@ -168,29 +291,52 @@ func installService() {
 		// 服务未知，创建服务
 		if err = s.Install(); err == nil {
 			s.Start()
-			log.Println("安装 ddns-go 服务成功! 请打开浏览器并进行配置。")
+			util.Log("安装 ddns-go 服务成功! 请打开浏览器并进行配置")
 			if service.ChosenSystem().String() == "unix-systemv" {
-				log.Println("如不能访问，请重启")
+				if _, err := exec.Command("/etc/init.d/ddns-go", "enable").Output(); err != nil {
+					log.Println(err)
+				}
+				if _, err := exec.Command("/etc/init.d/ddns-go", "start").Output(); err != nil {
+					log.Println(err)
+				}
 			}
 			return
 		}
-
-		log.Printf("安装 ddns-go 服务失败, ERR: %s\n", err)
+		util.Log("安装 ddns-go 服务失败, 异常信息: %s", err)
 	}
 
 	if status != service.StatusUnknown {
-		log.Println("ddns-go 服务已安装, 无需在次安装")
+		util.Log("ddns-go 服务已安装, 无需再次安装")
+	}
+}
+
+// 重启服务
+func restartService() {
+	s := getService()
+	status, err := s.Status()
+	if err == nil {
+		if status == service.StatusRunning {
+			if err = s.Restart(); err == nil {
+				util.Log("重启 ddns-go 服务成功")
+			}
+		} else if status == service.StatusStopped {
+			if err = s.Start(); err == nil {
+				util.Log("启动 ddns-go 服务成功")
+			}
+		}
+	} else {
+		util.Log("ddns-go 服务未安装, 请先安装服务")
 	}
 }
 
 // 打开浏览器
 func autoOpenExplorer() {
-	_, err := config.GetConfigCache()
+	_, err := config.GetConfigCached()
 	// 未找到配置文件
 	if err != nil {
 		if util.IsRunInDocker() {
 			// docker中运行, 提示
-			fmt.Println("Docker中运行, 请在浏览器中打开 http://docker主机IP:端口 进行配置")
+			util.Log("Docker中运行, 请在浏览器中打开 http://docker主机IP:9876 进行配置")
 		} else {
 			// 主机运行, 打开浏览器
 			addr, err := net.ResolveTCPAddr("tcp", *listen)
@@ -206,92 +352,66 @@ func autoOpenExplorer() {
 	}
 }
 
-const sysvScript = `#!/bin/sh
-# For RedHat and cousins:
-# chkconfig: - 99 01
-# description: {{.Description}}
-# processname: {{.Path}}
-### BEGIN INIT INFO
-# Provides:          {{.Path}}
-# Required-Start:    $local_fs $network $named $time
-# Required-Stop:     $local_fs $network $named
-# Default-Start:     2 3 4 5
-# Default-Stop:      0 1 6
-# Short-Description: {{.DisplayName}}
-# Description:       {{.Description}}
-### END INIT INFO
+const sysvScript = `#!/bin/sh /etc/rc.common
+DESCRIPTION="{{.Description}}"
 cmd="{{.Path}}{{range .Arguments}} {{.|cmd}}{{end}}"
-name=$(basename $(readlink -f $0))
+name="ddns-go"
 pid_file="/var/run/$name.pid"
 stdout_log="/var/log/$name.log"
 stderr_log="/var/log/$name.err"
-[ -e /etc/sysconfig/$name ] && . /etc/sysconfig/$name
+START=99
 get_pid() {
     cat "$pid_file"
 }
 is_running() {
     [ -f "$pid_file" ] && cat /proc/$(get_pid)/stat > /dev/null 2>&1
 }
-case "$1" in
-    start)
-        if is_running; then
-            echo "Already started"
-        else
-            echo "Starting $name"
-            {{if .WorkingDirectory}}cd '{{.WorkingDirectory}}'{{end}}
-            $cmd >> "$stdout_log" 2>> "$stderr_log" &
-            echo $! > "$pid_file"
-            if ! is_running; then
-                echo "Unable to start, see $stdout_log and $stderr_log"
-                exit 1
-            fi
-        fi
-    ;;
-    stop)
-        if is_running; then
-            echo -n "Stopping $name.."
-            kill $(get_pid)
-            for i in $(seq 1 10)
-            do
-                if ! is_running; then
-                    break
-                fi
-                echo -n "."
-                sleep 1
-            done
-            echo
-            if is_running; then
-                echo "Not stopped; may still be shutting down or shutdown may have failed"
-                exit 1
-            else
-                echo "Stopped"
-                if [ -f "$pid_file" ]; then
-                    rm "$pid_file"
-                fi
-            fi
-        else
-            echo "Not running"
-        fi
-    ;;
-    restart)
-        $0 stop
-        if is_running; then
-            echo "Unable to stop, will not attempt to start"
-            exit 1
-        fi
-        $0 start
-    ;;
-    status)
-        if is_running; then
-            echo "Running"
-        else
-            echo "Stopped"
-            exit 1
-        fi
-    ;;
-    *)
-        $0 start
-    ;;
-esac
-exit 0
+start() {
+	if is_running; then
+		echo "Already started"
+	else
+		echo "Starting $name"
+		{{if .WorkingDirectory}}cd '{{.WorkingDirectory}}'{{end}}
+		$cmd >> "$stdout_log" 2>> "$stderr_log" &
+		echo $! > "$pid_file"
+		if ! is_running; then
+			echo "Unable to start, see $stdout_log and $stderr_log"
+			exit 1
+		fi
+	fi
+}
+stop() {
+	if is_running; then
+		echo -n "Stopping $name.."
+		kill $(get_pid)
+		for i in $(seq 1 10)
+		do
+			if ! is_running; then
+				break
+			fi
+			echo -n "."
+			sleep 1
+		done
+		echo
+		if is_running; then
+			echo "Not stopped; may still be shutting down or shutdown may have failed"
+			exit 1
+		else
+			echo "Stopped"
+			if [ -f "$pid_file" ]; then
+				rm "$pid_file"
+			fi
+		fi
+	else
+		echo "Not running"
+	fi
+}
+restart() {
+	stop
+	if is_running; then
+		echo "Unable to stop, will not attempt to start"
+		exit 1
+	fi
+	start
+}
 `
